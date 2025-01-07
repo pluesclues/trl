@@ -59,7 +59,7 @@ from trl import (
     get_quantization_config,
 )
 from trl.trainer.utils import SIMPLE_CHAT_TEMPLATE
-
+from unsloth import FastLanguageModel
 
 JUDGES = {"pair_rm": PairRMJudge, "openai": OpenAIPairwiseJudge, "hf": HfPairwiseJudge}
 
@@ -81,23 +81,35 @@ if __name__ == "__main__":
         quantization_config=quantization_config,
     )
 
-    model = AutoModelForCausalLM.from_pretrained(
-        model_args.model_name_or_path, trust_remote_code=model_args.trust_remote_code, **model_kwargs
-    )
+    # model = AutoModelForCausalLM.from_pretrained(
+    #     model_args.model_name_or_path, trust_remote_code=model_args.trust_remote_code, **model_kwargs
+    # )
+    
 
     if training_args.reward_model_path is not None:
+        # reward_model = AutoModelForSequenceClassification.from_pretrained(
+        #     training_args.reward_model_path,
+        #     num_labels=1,
+        #     trust_remote_code=model_args.trust_remote_code,
+        #     **model_kwargs,
+        # )
+        # reward_tokenizer = AutoTokenizer.from_pretrained(
+        #     training_args.reward_model_path,
+        #     trust_remote_code=model_args.trust_remote_code,
+        #     truncation=True,
+        #     truncation_side="left",  # since we judge the completion, truncating left is more appropriate
+        # )
+        FastLanguageModel.reset_functions()
+        # create the reward model and optimizer
         reward_model = AutoModelForSequenceClassification.from_pretrained(
             training_args.reward_model_path,
+            revision = training_args.reward_model_revision, 
             num_labels=1,
-            trust_remote_code=model_args.trust_remote_code,
-            **model_kwargs,
+            torch_dtype=torch.bfloat16,
+            attn_implementation="flash_attention_2",
+            use_cache=False,
         )
-        reward_tokenizer = AutoTokenizer.from_pretrained(
-            training_args.reward_model_path,
-            trust_remote_code=model_args.trust_remote_code,
-            truncation=True,
-            truncation_side="left",  # since we judge the completion, truncating left is more appropriate
-        )
+        FastLanguageModel.set_functions()
     else:
         reward_model = None
         reward_tokenizer = None
@@ -108,12 +120,45 @@ if __name__ == "__main__":
     else:
         judge = None
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_args.model_name_or_path,
-        padding_side="left",
-        trust_remote_code=model_args.trust_remote_code,
-        **model_kwargs,
+    # tokenizer = AutoTokenizer.from_pretrained(
+    #     model_args.model_name_or_path,
+    #     padding_side="left",
+    #     trust_remote_code=model_args.trust_remote_code,
+    #     **model_kwargs,
+    # )
+    #Create the models
+    max_seq_length = 2048 # Choose any! We auto support RoPE Scaling internally!
+    dtype = None # None for auto detection. Float16 for Tesla T4, V100, Bfloat16 for Ampere+
+    load_in_4bit = True # Use 4bit quantization to reduce memory usage. Can be False.
+
+    model, tokenizer = FastLanguageModel.from_pretrained(
+      model_name = model_args.model_name_or_path, # "unsloth/tinyllama" for 16bit loading
+      max_seq_length = max_seq_length,
+      dtype = dtype,
+      load_in_4bit = load_in_4bit,
+      token = "", # use one if using gated models like meta-llama/Llama-2-7b-hf
     )
+
+    model = FastLanguageModel.get_peft_model(
+        model,
+        r = 16, # Choose any number > 0 ! Suggested 8, 16, 32, 64, 128
+        target_modules = ["q_proj", "k_proj", "v_proj", "o_proj",
+                        "gate_proj", "up_proj", "down_proj",],
+        lora_alpha = 16,
+        lora_dropout = 0, # Supports any, but = 0 is optimized 1e-7
+        bias = "none",    # Supports any, but = "none" is optimized
+        # [NEW] "unsloth" uses 30% less VRAM, fits 2x larger batch sizes!
+        use_gradient_checkpointing = "unsloth", # True or "unsloth" for very long context
+        random_state = 3407,
+        use_rslora = False,  # We support rank stabilized LoRA
+        loftq_config = None, # And LoftQ
+    )
+
+    reward_model_tokenizer  = tokenizer
+
+    tokenizer.padding_side="right"
+    tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+
     if tokenizer.chat_template is None:
         tokenizer.chat_template = SIMPLE_CHAT_TEMPLATE
     if tokenizer.pad_token_id is None:
