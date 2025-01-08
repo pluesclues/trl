@@ -16,15 +16,16 @@
 Usage:
 
 python examples/scripts/dpo_online.py \
-    --model_name_or_path trl-lib/pythia-1b-deduped-tldr-sft  \
-    --reward_model_path trl-lib/pythia-1b-deduped-tldr-rm \
+    --model_name_or_path keithdrexel/unsloth-llama-3.2-1b-tldr-unsloth-nobnb  \
+    --reward_model_path keithdrexel/reward_modeling__meta-llama_Llama-3.2-1B \
     --dataset_name trl-lib/tldr \
     --learning_rate 5.0e-7 \
     --output_dir pythia-1b-tldr-online-dpo \
     --per_device_train_batch_size 8 \
     --gradient_accumulation_steps 16 \
     --warmup_ratio 0.1 \
-    --missing_eos_penalty 1.0
+    --missing_eos_penalty 1.0 \ 
+    --logging_steps 20
 
 With LoRA:
 python examples/scripts/dpo_online.py \
@@ -126,6 +127,7 @@ if __name__ == "__main__":
     #     trust_remote_code=model_args.trust_remote_code,
     #     **model_kwargs,
     # )
+    
     #Create the models
     max_seq_length = 2048 # Choose any! We auto support RoPE Scaling internally!
     dtype = None # None for auto detection. Float16 for Tesla T4, V100, Bfloat16 for Ampere+
