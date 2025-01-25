@@ -16,16 +16,15 @@
 Usage:
 
 python examples/scripts/dpo_online.py \
-    --model_name_or_path keithdrexel/unsloth-llama-3.2-1b-tldr-unsloth-nobnb  \
-    --reward_model_path keithdrexel/reward_modeling__meta-llama_Llama-3.2-1B \
+    --model_name_or_path trl-lib/pythia-1b-deduped-tldr-sft  \
+    --reward_model_path trl-lib/pythia-1b-deduped-tldr-rm \
     --dataset_name trl-lib/tldr \
     --learning_rate 5.0e-7 \
     --output_dir pythia-1b-tldr-online-dpo \
     --per_device_train_batch_size 8 \
     --gradient_accumulation_steps 16 \
     --warmup_ratio 0.1 \
-    --missing_eos_penalty 1.0 \ 
-    --logging_steps 20
+    --missing_eos_penalty 1.0
 
 With LoRA:
 python examples/scripts/dpo_online.py \
@@ -44,7 +43,7 @@ python examples/scripts/dpo_online.py \
 import torch
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoModelForSequenceClassification, AutoTokenizer, GenerationConfig
-
+import sys
 from trl import (
     HfPairwiseJudge,
     LogCompletionsCallback,
@@ -100,17 +99,26 @@ if __name__ == "__main__":
         #     truncation=True,
         #     truncation_side="left",  # since we judge the completion, truncating left is more appropriate
         # )
+        #breakpoint()
         FastLanguageModel.reset_functions()
         # create the reward model and optimizer
         reward_model = AutoModelForSequenceClassification.from_pretrained(
             training_args.reward_model_path,
-            revision = training_args.reward_model_revision, 
+            revision = "reward_modeling__1__1728309120", 
             num_labels=1,
             torch_dtype=torch.bfloat16,
             attn_implementation="flash_attention_2",
             use_cache=False,
         )
         FastLanguageModel.set_functions()
+
+        reward_tokenizer = AutoTokenizer.from_pretrained(
+            training_args.reward_model_path,
+            revision = "reward_modeling__1__1728309120", 
+            trust_remote_code=model_args.trust_remote_code,
+            truncation=True,
+            truncation_side="left",  # since we judge the completion, truncating left is more appropriate
+        )
     else:
         reward_model = None
         reward_tokenizer = None
@@ -127,7 +135,6 @@ if __name__ == "__main__":
     #     trust_remote_code=model_args.trust_remote_code,
     #     **model_kwargs,
     # )
-    
     #Create the models
     max_seq_length = 2048 # Choose any! We auto support RoPE Scaling internally!
     dtype = None # None for auto detection. Float16 for Tesla T4, V100, Bfloat16 for Ampere+
@@ -141,25 +148,33 @@ if __name__ == "__main__":
       token = "", # use one if using gated models like meta-llama/Llama-2-7b-hf
     )
 
-    model = FastLanguageModel.get_peft_model(
-        model,
-        r = 16, # Choose any number > 0 ! Suggested 8, 16, 32, 64, 128
-        target_modules = ["q_proj", "k_proj", "v_proj", "o_proj",
-                        "gate_proj", "up_proj", "down_proj",],
-        lora_alpha = 16,
-        lora_dropout = 0, # Supports any, but = 0 is optimized 1e-7
-        bias = "none",    # Supports any, but = "none" is optimized
-        # [NEW] "unsloth" uses 30% less VRAM, fits 2x larger batch sizes!
-        use_gradient_checkpointing = "unsloth", # True or "unsloth" for very long context
-        random_state = 3407,
-        use_rslora = False,  # We support rank stabilized LoRA
-        loftq_config = None, # And LoftQ
-    )
+    # ref_model, tokenizer = FastLanguageModel.from_pretrained(
+    #   model_name = model_args.model_name_or_path, # "unsloth/tinyllama" for 16bit loading
+    #   max_seq_length = max_seq_length,
+    #   dtype = dtype,
+    #   load_in_4bit = load_in_4bit,
+    #   token = "", # use one if using gated models like meta-llama/Llama-2-7b-hf
+    # )
+
+    # ref_model = FastLanguageModel.get_peft_model(
+    #     model,
+    #     r = 16, # Choose any number > 0 ! Suggested 8, 16, 32, 64, 128
+    #     target_modules = ["q_proj", "k_proj", "v_proj", "o_proj",
+    #                     "gate_proj", "up_proj", "down_proj",],
+    #     lora_alpha = 16,
+    #     lora_dropout = 0, # Supports any, but = 0 is optimized 1e-7
+    #     bias = "none",    # Supports any, but = "none" is optimized
+    #     # [NEW] "unsloth" uses 30% less VRAM, fits 2x larger batch sizes!
+    #     use_gradient_checkpointing = "unsloth", # True or "unsloth" for very long context
+    #     random_state = 3407,
+    #     use_rslora = False,  # We support rank stabilized LoRA
+    #     loftq_config = None, # And LoftQ
+    # )
 
     reward_model_tokenizer  = tokenizer
 
-    tokenizer.padding_side="right"
-    tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+    # tokenizer.padding_side="right"
+    # tokenizer.add_special_tokens({"pad_token": "[PAD]"})
 
     if tokenizer.chat_template is None:
         tokenizer.chat_template = SIMPLE_CHAT_TEMPLATE
@@ -167,20 +182,23 @@ if __name__ == "__main__":
         tokenizer.pad_token = tokenizer.eos_token
 
     dataset = load_dataset(script_args.dataset_name, name=script_args.dataset_config)
-
+    #breakpoint()
     trainer = OnlineDPOTrainer(
         model=model,
+        #ref_model=ref_model,
         reward_model=reward_model,
         judge=judge,
         args=training_args,
         train_dataset=dataset[script_args.dataset_train_split],
         eval_dataset=dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None,
         processing_class=tokenizer,
-        reward_processing_class=reward_tokenizer,
+        reward_processing_class=reward_model_tokenizer,
         peft_config=get_peft_config(model_args),
     )
 
+    #breakpoint()
     if training_args.eval_strategy != "no":
+        #breakpoint()
         generation_config = GenerationConfig(
             max_new_tokens=training_args.max_new_tokens, do_sample=True, temperature=training_args.temperature
         )
