@@ -29,6 +29,7 @@ import transformers
 from datasets import Dataset
 from packaging import version
 from torch.utils.data import DataLoader, IterableDataset
+import bitsandbytes as bnb
 from transformers import (
     BaseImageProcessor,
     DataCollator,
@@ -78,12 +79,13 @@ if is_sagemaker_mp_enabled():
 
 else:
     IS_SAGEMAKER_MP_POST_1_10 = False
-
+#breakpoint()
 if is_wandb_available():
     import wandb
 
 logger = logging.get_logger(__name__)
 
+from unsloth import FastLanguageModel
 
 class OnlineDPOTrainer(Trainer):
     r"""
@@ -154,7 +156,7 @@ class OnlineDPOTrainer(Trainer):
             )
 
         self.ref_model = ref_model
-
+        
         if reward_model is not None and judge is not None:
             warnings.warn(
                 "Both `reward_model` and `judge` are provided. Please choose provide only one of them. "
@@ -193,8 +195,24 @@ class OnlineDPOTrainer(Trainer):
             if isinstance(model, PeftModel):
                 model = model.merge_and_unload()
 
+            #breakpoint()
+            
             # Get peft model with the given config
-            model = get_peft_model(model, peft_config)
+            model = FastLanguageModel.get_peft_model(
+                model,
+                r = 16, # Choose any number > 0 ! Suggested 8, 16, 32, 64, 128
+                target_modules = ["q_proj", "k_proj", "v_proj", "o_proj",
+                                "gate_proj", "up_proj", "down_proj",],
+                lora_alpha = 16,
+                lora_dropout = 0, # Supports any, but = 0 is optimized 1e-7
+                bias = "none",    # Supports any, but = "none" is optimized
+                # [NEW] "unsloth" uses 30% less VRAM, fits 2x larger batch sizes!
+                use_gradient_checkpointing = "unsloth", # True or "unsloth" for very long context
+                random_state = 3407,
+                use_rslora = False,  # We support rank stabilized LoRA
+                loftq_config = None, # And LoftQ
+            )
+            #model = get_peft_model(model, peft_config)
 
         # Disable dropout in the model and reference model
         if args.disable_dropout:
@@ -206,6 +224,7 @@ class OnlineDPOTrainer(Trainer):
         # Usually, the user wants the ref model to be the initial version of the model. When using PEFT, it's easy to
         # get the ref model, as it's just the model with a disabled adapter. When not using PEFT, we need to create
         # the ref model from the model by copying it and disable the gradients and set it in evaluation mode.
+        #breakpoint()
         if ref_model is None:  # No ref model provided, the most common case
             if peft_config is None:
                 self.ref_model = create_reference_model(model)  # copy, disable gradients, set eval mode
@@ -270,7 +289,7 @@ class OnlineDPOTrainer(Trainer):
             optimizers=optimizers,
             preprocess_logits_for_metrics=preprocess_logits_for_metrics,
         )
-
+        
         # Add tags for models that have been loaded with the correct transformers version
         if hasattr(self.model, "add_model_tags"):
             self.model.add_model_tags(self._tag_names)
@@ -292,7 +311,7 @@ class OnlineDPOTrainer(Trainer):
                 self.ref_model = self.ref_model.to(self.accelerator.device)
             if self.reward_model is not None:
                 self.reward_model = self.reward_model.to(self.accelerator.device)
-
+        
     @property
     def beta(self):
         if isinstance(self._beta, list):
@@ -393,8 +412,11 @@ class OnlineDPOTrainer(Trainer):
     def training_step(
         self, model: nn.Module, inputs: dict[str, Union[torch.Tensor, Any]], num_items_in_batch: Optional[int] = None
     ) -> torch.Tensor:
+        model = model.module
         model.train()
-
+        from unsloth import FastLanguageModel
+        FastLanguageModel.for_training(model)
+        #breakpoint()
         # Apply chat template and tokenize the input.
         # We do this on-the-fly to enable the use of reward models and policies with different tokenizers / chat templates.
         batch_size = len(next(iter(inputs.values())))
@@ -409,13 +431,19 @@ class OnlineDPOTrainer(Trainer):
         num_examples, context_length = inputs["prompt_input_ids"].shape
         prompt_ids = inputs["prompt_input_ids"].repeat(2, 1)
         prompt_mask = inputs["prompt_attention_mask"].repeat(2, 1)
-        with unwrap_model_for_generation(model, self.accelerator) as unwrapped_model:
-            output = unwrapped_model.generate(
-                input_ids=prompt_ids,
-                attention_mask=prompt_mask,
-                generation_config=self.generation_config,
-            )
+        with unwrap_model_for_generation(model, self.accelerator, is_peft_model=True) as unwrapped_model:
+            #breakpoint()
+            FastLanguageModel.for_inference(model)
+            #breakpoint()
+            output = model.generate(input_ids=prompt_ids, attention_mask=prompt_mask,generation_config=self.generation_config,)
+            FastLanguageModel.for_training(model)
+            #breakpoint()
         del inputs
+        #breakpoint()
+        # if self.state.global_step == 1:
+        #     breakpoint()
+        #if self.state.global_step != 0 and self.state.global_step%500 == 0 or self.state.global_step == 7294:
+        #    model.push_to_hub_merged("keithdrexel/unsloth-llama-3.2-1b-tldr-unsloth-dpo_mid_checkpoint_trl", self.processing_class, save_method = "merged_16bit", token = "")
 
         completion_ids = output[:, context_length:]
         completion_ids, completion_mask = truncate_right(
@@ -424,7 +452,7 @@ class OnlineDPOTrainer(Trainer):
         contain_eos_token = torch.any(completion_ids == self.processing_class.eos_token_id, dim=-1)
         prompt_completion_ids = torch.cat((prompt_ids, completion_ids), dim=1)
         prompt_completion_mask = torch.cat((prompt_mask, completion_mask), dim=1)
-
+        
         # Get the logprobs of the completions from the model
         output = model(prompt_completion_ids, attention_mask=prompt_completion_mask)
         # There is 1 offset, because the model predict the next token
@@ -436,11 +464,14 @@ class OnlineDPOTrainer(Trainer):
         del output, logits, all_logprobs  # free memory
 
         # Same for the reference model
+        #breakpoint()
         with torch.no_grad():
             if self.ref_model is not None:
+                FastLanguageModel.for_training(self.ref_model)
                 ref_output = self.ref_model(prompt_completion_ids, attention_mask=prompt_completion_mask)
             else:  # peft case: we just need to disable the adapter
                 with self.model.disable_adapter():
+                    FastLanguageModel.for_training(self.model)
                     ref_output = self.model(prompt_completion_ids, attention_mask=prompt_completion_mask)
             ref_logits = ref_output.logits[:, context_length - 1 : -1]
             ref_all_logprobs = F.log_softmax(ref_logits, dim=-1)
@@ -560,6 +591,7 @@ class OnlineDPOTrainer(Trainer):
         kl = logprobs - ref_logprobs
         mean_kl = kl.sum(1).mean()
         self.stats["objective/kl"].append(self.accelerator.gather_for_metrics(mean_kl).mean().item())
+        #breakpoint()
         non_score_reward = (-self.beta * kl).sum(1)
         mean_non_score_reward = non_score_reward.mean()
         self.stats["objective/non_score_reward"].append(
@@ -601,6 +633,7 @@ class OnlineDPOTrainer(Trainer):
             with amp.scale_loss(loss, self.optimizer) as scaled_loss:
                 scaled_loss.backward()
         else:
+            #breakpoint()
             self.accelerator.backward(loss, **kwargs)
 
         return loss.detach() / self.args.gradient_accumulation_steps
@@ -637,16 +670,16 @@ class OnlineDPOTrainer(Trainer):
                 self.log(logs)
 
         metrics = None
-        if self.control.should_evaluate:
-            metrics = self._evaluate(trial, ignore_keys_for_eval)
-            is_new_best_metric = self._determine_best_metric(metrics=metrics, trial=trial)
+        # if self.control.should_evaluate:
+        #     metrics = self._evaluate(trial, ignore_keys_for_eval)
+        #     is_new_best_metric = self._determine_best_metric(metrics=metrics, trial=trial)
 
-            if self.args.save_strategy == "best":
-                self.control.should_save = is_new_best_metric
+        #     if self.args.save_strategy == "best":
+        #         self.control.should_save = is_new_best_metric
 
-        if self.control.should_save:
-            self._save_checkpoint(model, trial)
-            self.control = self.callback_handler.on_save(self.args, self.state, self.control)
+        # if self.control.should_save:
+        #     self._save_checkpoint(model, trial)
+        #     self.control = self.callback_handler.on_save(self.args, self.state, self.control)
 
     # Copy-pasted from transformers.Trainer to maintain compatibility with earlier versions.
     # This can be removed once the minimum transformers version is updated to 4.47.
